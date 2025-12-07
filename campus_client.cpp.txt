@@ -1,0 +1,346 @@
+// campus_client.cpp
+// Campus client - FINAL FIXED VERSION
+// TCP: AUTH + MSG
+// UDP: HEARTBEAT (Send) + BROADCAST (Listen with SO_REUSEPORT)
+#include <fstream>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace std;
+
+constexpr int TCP_PORT = 5000;
+constexpr int UDP_PORT = 6000;
+constexpr int UDP_PORT_BROADCAST = 6001;
+
+const string SERVER_IP = "127.0.0.1";
+
+struct ChatEntry {
+    vector<string> messages;
+    int unread = 0;
+};
+
+string campusName;
+string password;
+int tcp_sock = -1;
+map<string, ChatEntry> chats; // key: "Campus|Dept"
+mutex chats_mtx;
+
+string now_str() {
+    auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
+    string s = string(ctime(&t));
+    if (!s.empty() && s.back()=='\n') s.pop_back();
+    return s;
+}
+
+void log_now(const string &s) { cout << "[" << now_str() << "] " << s << "\n"; }
+
+void udp_heartbeat() {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) { perror("udp"); return; }
+    sockaddr_in serv{};
+    serv.sin_family = AF_INET;
+    serv.sin_port = htons(UDP_PORT);
+    serv.sin_addr.s_addr = inet_addr(SERVER_IP.c_str());
+    while (true) {
+        string pkt = "HEARTBEAT|" + campusName;
+        sendto(s, pkt.c_str(), pkt.size(), 0, (sockaddr*)&serv, sizeof(serv));
+        this_thread::sleep_for(chrono::seconds(10));
+    }
+}
+
+// UDP listener thread: Listens for ADMIN_BROADCAST on Port 6001
+// USES SO_REUSEADDR/PORT and binds to INADDR_ANY
+void udp_listener_client() {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return;
+
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    #ifdef SO_REUSEPORT
+    setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    #endif
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(UDP_PORT_BROADCAST);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY); 
+
+    if (bind(s, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("UDP Bind Failed");
+        close(s);
+        return;
+    }
+
+    char buf[2048];
+    while (true) {
+        sockaddr_in src{};
+        socklen_t len = sizeof(src);
+        ssize_t r = recvfrom(s, buf, sizeof(buf)-1, 0, (sockaddr*)&src, &len);
+        if (r <= 0) continue;
+        buf[r] = 0;
+        string pkt(buf);
+
+        if (pkt.rfind("ADMIN_BROADCAST|", 0) == 0) {
+            string msg = pkt.substr(16);
+            
+            cout << "\n\r" 
+                 << "\033[1;41;97m [!!! ADMIN BROADCAST !!!] \033[0m\n"
+                 << "\033[1;31m " << msg << " \033[0m\n"
+                 << "Choose: " << flush;
+        }
+    }
+}
+
+void tcp_receiver() {
+    char buf[8192]; // Increased buffer size for file chunks
+    while (true) {
+        ssize_t r = recv(tcp_sock, buf, sizeof(buf)-1, 0);
+        if (r <= 0) { log_now("Disconnected from server."); close(tcp_sock); exit(0); }
+        buf[r] = 0;
+        string pkt(buf);
+
+        // --- NEW BLOCK: Handle Incoming Files ---
+        if (pkt.rfind("FILE|", 0) == 0) {
+            // Expected: FILE|Src|SrcD|Dst|DstD|Filename|Content
+            vector<string> p;
+            istringstream ss(pkt);
+            string tok;
+            while (getline(ss,tok,'|')) p.push_back(tok);
+            
+            if (p.size() >= 7) {
+                 string src = p[1], srcd = p[2], fname = p[5];
+                 
+                 // Extract Content (everything after the 6th pipe)
+                 size_t pos = 0; int cnt=0;
+                 for (size_t i=0;i<pkt.size();++i) { 
+                     if (pkt[i]=='|') { 
+                         cnt++; 
+                         if (cnt==6) { pos=i+1; break; } 
+                     } 
+                 }
+                 string content = (pos < pkt.size()) ? pkt.substr(pos) : "";
+                 
+                 // Save to disk with "recv_" prefix
+                 string saveName = "recv_" + fname;
+                 ofstream outfile(saveName);
+                 outfile << content;
+                 outfile.close();
+                 
+                 // Log to chat window so user sees it
+                 string key = src + "|" + srcd;
+                 string msg = "[" + now_str() + "] [FILE] Received '" + fname + "', saved as '" + saveName + "'";
+                 {
+                     lock_guard<mutex> lock(chats_mtx);
+                     chats[key].messages.push_back(msg);
+                     chats[key].unread++;
+                 }
+                 log_now("File Received from " + src + "-" + srcd);
+            }
+        }
+        // --- EXISTING BLOCK: Handle Standard Text Messages ---
+        else if (pkt.rfind("FROM|",0) == 0) {
+            vector<string> p;
+            istringstream ss(pkt);
+            string tok;
+            while (getline(ss,tok,'|')) p.push_back(tok);
+            if (p.size() >= 6) {
+                string src = p[1], srcd = p[2];
+                size_t pos = 0; int cnt = 0;
+                for (size_t i=0;i<pkt.size();++i) { if (pkt[i]=='|') { cnt++; if (cnt==5) { pos=i+1; break; } } }
+                string payload = (pos < pkt.size()) ? pkt.substr(pos) : p[5];
+                string key = src + "|" + srcd;
+                string line = "[" + now_str() + "] " + src + "-" + srcd + ": " + payload;
+                {
+                    lock_guard<mutex> lock(chats_mtx);
+                    chats[key].messages.push_back(line);
+                    chats[key].unread++;
+                }
+                log_now("New message from " + src + "-" + srcd);
+            }
+        } 
+        // --- EXISTING BLOCK: Server Notifications ---
+        else {
+            log_now("Server: " + pkt);
+        }
+    }
+}
+int choose_department_interactive() {
+    cout << "Select your department for this message:\n";
+    cout << "1) Admissions\n2) Academics\n3) IT\n4) Sports\nChoose (1-4): ";
+    int d = 0;
+    if (!(cin >> d)) {
+        cin.clear();
+        string dum; getline(cin, dum);
+        return 1;
+    }
+    string flush; getline(cin, flush); // consume leftover newline
+    if (d < 1 || d > 4) return 1;
+    return d;
+}
+
+string dept_name_by_choice(int d) {
+    switch (d) {
+        case 1: return "Admissions";
+        case 2: return "Academics";
+        case 3: return "IT";
+        case 4: return "Sports";
+        default: return "General";
+    }
+}
+
+void send_msg(const string &srcDept, const string &dstC, const string &dstD, const string &msg) {
+    if (tcp_sock < 0) return;
+    string pkt = "MSG|" + campusName + "|" + srcDept + "|" + dstC + "|" + dstD + "|" + msg;
+    send(tcp_sock, pkt.c_str(), pkt.size(), 0);
+    string key = dstC + "|" + dstD;
+    string line = "[" + now_str() + "] You(" + campusName + "-" + srcDept + "): " + msg;
+    lock_guard<mutex> lock(chats_mtx);
+    chats[key].messages.push_back(line);
+}
+
+void show_inbox_ui() {
+    vector<string> keys;
+    {
+        lock_guard<mutex> lock(chats_mtx);
+        if (chats.empty()) { cout << "Inbox empty\n"; return; }
+        int i = 1;
+        for (auto &e : chats) {
+            cout << i++ << ") " << e.first << " (NEW: " << e.second.unread << ")\n";
+            keys.push_back(e.first);
+        }
+    }
+
+    cout << "Select chat number (0 back): ";
+    int sel;
+    if (!(cin >> sel)) { cin.clear(); string dum; getline(cin,dum); return; }
+    string flush; getline(cin, flush); // consume newline
+    if (sel <= 0 || sel > (int)keys.size()) return;
+    string key = keys[sel-1];
+
+    {
+        lock_guard<mutex> lock(chats_mtx);
+        auto &ce = chats[key];
+        cout << "---- Chat: " << key << " ----\n";
+        for (size_t j=0;j<ce.messages.size();++j) cout << j+1 << ") " << ce.messages[j] << "\n";
+        ce.unread = 0;
+    }
+
+    cout << "Reply? (y/n): ";
+    string ans; getline(cin, ans);
+    if (ans == "y" || ans == "Y") {
+        cout << "Choose department you are sending AS (this message):\n";
+        int d = choose_department_interactive();
+        string srcDept = dept_name_by_choice(d);
+        cout << "Enter reply: ";
+        string reply; getline(cin, reply);
+        size_t pos = key.find('|');
+        string dstC = key.substr(0,pos);
+        string dstD = key.substr(pos+1);
+        send_msg(srcDept, dstC, dstD, reply);
+    }
+}
+void send_file_ui() {
+    cout << "Select Dept sending AS (1-4): ";
+    int d = choose_department_interactive();
+    string srcDept = dept_name_by_choice(d);
+
+    cout << "Target Campus: "; string dstC; getline(cin, dstC);
+    cout << "Target Dept: "; string dstD; getline(cin, dstD);
+    if (dstD.empty()) dstD="General";
+
+    cout << "Filename (must be in current folder): "; 
+    string fname; getline(cin, fname);
+
+    ifstream f(fname);
+    if (!f.is_open()) { cout << "Error: File not found.\n"; return; }
+
+    // Read file content
+    stringstream buffer;
+    buffer << f.rdbuf();
+    string content = buffer.str();
+    f.close();
+
+    // Protocol: FILE|SrcC|SrcD|DstC|DstD|Filename|Content
+    if (tcp_sock >= 0) {
+        string pkt = "FILE|" + campusName + "|" + srcDept + "|" + dstC + "|" + dstD + "|" + fname + "|" + content;
+        send(tcp_sock, pkt.c_str(), pkt.size(), 0);
+        cout << "File sent.\n";
+    }
+}
+
+
+
+void client_menu() {
+    while (true) {
+        cout << "\n--- MENU ---\n";
+        cout << "1) Send Message\n2) Inbox\n3) Send file\n4) Exit\nChoose: ";
+        int op = 0;
+        if (!(cin >> op)) { cin.clear(); string dum; getline(cin,dum); continue; }
+        string flush; getline(cin, flush); // consume newline
+
+        if (op == 1) {
+            int d = choose_department_interactive();
+            string srcDept = dept_name_by_choice(d);
+            string dstC, dstD, msg;
+            cout << "Target Campus: "; getline(cin, dstC);
+            cout << "Target Dept: "; getline(cin, dstD);
+            if (dstD.empty()) dstD = "General";
+            cout << "Message: "; getline(cin, msg);
+            if (dstC.empty()) { cout << "Target campus required\n"; continue; }
+            send_msg(srcDept, dstC, dstD, msg);
+        }
+        else if (op == 2) {
+            show_inbox_ui();
+        }
+        else if (op == 3) {
+            send_file_ui();
+        }
+        else if (op == 4) {
+            close(tcp_sock);
+            log_now("Exiting client.");
+            exit(0);
+        }
+        else {
+            cout << "Invalid\n";
+        }
+    }
+}
+
+int main() {
+    cout << "Enter Campus Name (e.g. Lahore): ";
+    getline(cin, campusName);
+    if (campusName.empty()) campusName = "Unknown";
+    cout << "Enter Password: ";
+    getline(cin, password);
+
+    tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_sock < 0) { perror("tcp socket"); return 1; }
+    sockaddr_in serv{};
+    serv.sin_family = AF_INET;
+    serv.sin_port = htons(TCP_PORT);
+    serv.sin_addr.s_addr = inet_addr(SERVER_IP.c_str());
+    if (connect(tcp_sock, (sockaddr*)&serv, sizeof(serv)) < 0) { perror("connect"); return 1; }
+
+    string auth = "AUTH|" + campusName + "|" + password;
+    send(tcp_sock, auth.c_str(), auth.size(), 0);
+
+    thread hb(udp_heartbeat); hb.detach();
+    thread recvT(tcp_receiver); recvT.detach();
+    thread udpL(udp_listener_client); udpL.detach();
+
+    client_menu();
+    return 0;
+}
+

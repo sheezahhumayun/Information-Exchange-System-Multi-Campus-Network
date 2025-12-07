@@ -1,0 +1,419 @@
+// server.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace std;
+
+constexpr int TCP_PORT = 5000;
+constexpr int UDP_PORT = 6000;
+constexpr int UDP_PORT_BROADCAST = 6001;
+
+struct ClientInfo {
+    int sockfd = -1;
+    string campus;
+    time_t last_seen = 0;
+};
+
+struct MessageRecord {
+    string type;
+    string from_campus;
+    string from_dept;
+    string to_campus;
+    string to_dept;
+    string payload;
+    time_t ts;
+};
+
+struct ChatEntry {
+    vector<MessageRecord> msgs;
+    int unread = 0;
+};
+
+map<string,string> credentials = {
+    {"Lahore", "NU-LHR-123"},
+    {"Karachi","NU-KHI-123"},
+    {"Peshawar","NU-PSH-123"},
+    {"Multan","NU-MTN-123"},
+    {"CFD","NU-CFD-123"},
+    {"Islamabad","NU-ISB-123"}
+};
+
+map<string, ClientInfo> clients;         // key: campus (UNCHANGED)
+map<string, ChatEntry> serverInbox;      // key: "campus|dept"
+map<string, time_t> lastHeartbeat;       // heartbeat timestamps
+mutex clients_mtx, inbox_mtx, hb_mtx;
+
+string now_str() {
+    auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
+    string s = std::string(std::ctime(&t));
+    if (!s.empty() && s.back() == '\n') s.pop_back();
+    return s;
+}
+
+void log_now(const string &s) { cout << "[" << now_str() << "] " << s << "\n"; }
+
+// send UDP broadcast ADMIN_BROADCAST|text
+void send_udp_broadcast(const string &text) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) { perror("udp broadcast socket"); return; }
+    
+    int opt = 1;
+    // Allow broadcast
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
+
+    sockaddr_in bro{};
+    bro.sin_family = AF_INET;
+    bro.sin_port = htons(UDP_PORT_BROADCAST);
+    bro.sin_addr.s_addr = inet_addr("255.255.255.255");
+
+    string pkt = "ADMIN_BROADCAST|" + text;
+    int sent = sendto(s, pkt.c_str(), pkt.size(), 0, (sockaddr*)&bro, sizeof(bro));
+    
+    if (sent < 0) perror("Broadcast send failed");
+    else log_now("[ADMIN] broadcast sent: " + text);
+    
+    close(s);
+}
+
+// UDP listener thread: HEARTBEAT|Campus
+void udp_listener() {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) { perror("udp socket"); return; }
+
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    #ifdef SO_REUSEPORT
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    #endif
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(UDP_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    
+    if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { 
+        perror("Server UDP bind failed"); 
+        close(sock); 
+        return; 
+    }
+
+    char buf[2048];
+    while (true) {
+        sockaddr_in cli{};
+        socklen_t len = sizeof(cli);
+        ssize_t n = recvfrom(sock, buf, sizeof(buf)-1, 0, (sockaddr*)&cli, &len);
+        if (n <= 0) continue;
+        buf[n] = 0;
+        string pkt(buf);
+        // Expecting: "HEARTBEAT|CampusName"
+        if (pkt.rfind("HEARTBEAT|", 0) == 0) {
+            string campus = pkt.substr(10);
+            time_t t = time(nullptr);
+            {
+                lock_guard<mutex> lock(hb_mtx);
+                lastHeartbeat[campus] = t;
+            }
+            lock_guard<mutex> lock(clients_mtx);
+            if (clients.count(campus)) clients[campus].last_seen = t;
+        }
+    }
+}
+
+// forward message to connected client; returns true if sent
+// forward message (or file) to connected client; returns true if sent
+bool forward_to_client(const MessageRecord &mr) {
+    lock_guard<mutex> lock(clients_mtx);
+    if (!clients.count(mr.to_campus) || clients.at(mr.to_campus).sockfd < 0) return false;
+    
+    int dest = clients.at(mr.to_campus).sockfd;
+    
+    // For text messages, send "FROM|..." because client expects FROM
+    string pkt;
+    if (mr.type == "MSG") {
+        pkt = "FROM|" + mr.from_campus + "|" + mr.from_dept + "|" + mr.to_campus + "|" + mr.to_dept + "|" + mr.payload;
+    } else {
+        // keep FILE prefix for files (client handles FILE|)
+        pkt = "FILE|" + mr.from_campus + "|" + mr.from_dept + "|" + mr.to_campus + "|" + mr.to_dept + "|" + mr.payload;
+    }
+    
+    ssize_t s = send(dest, pkt.c_str(), pkt.size(), 0);
+    return s == (ssize_t)pkt.size();
+}
+
+void store_isb_inbox(const MessageRecord &mr) {
+    // keep existing behavior for messages specifically to Islamabad:
+    // store under sender key so admin can see who sent a message to server
+    string key = mr.from_campus + "|" + mr.from_dept;
+    lock_guard<mutex> lock(inbox_mtx);
+    serverInbox[key].msgs.push_back(mr);
+    serverInbox[key].unread++;
+}
+
+// TCP client handler
+void handle_tcp_client(int client_sock, string client_ip) {
+    char buf[8192]; // INCREASED BUFFER SIZE FOR FILES
+    ssize_t n = recv(client_sock, buf, sizeof(buf)-1, 0);
+    if (n <= 0) { close(client_sock); return; }
+    buf[n] = 0;
+    string auth(buf);
+    vector<string> parts;
+    {
+        istringstream ss(auth);
+        string t;
+        while (getline(ss,t,'|')) parts.push_back(t);
+    }
+    if (parts.size() < 3 || parts[0] != "AUTH") {
+        string err = "ERROR|Invalid AUTH format\n";
+        send(client_sock, err.c_str(), err.size(), 0);
+        close(client_sock);
+        return;
+    }
+    string campus = parts[1];
+    string pass = parts[2];
+
+    if (!credentials.count(campus) || credentials[campus] != pass) {
+        string err = "ERROR|Authentication failed\n";
+        send(client_sock, err.c_str(), err.size(), 0);
+        close(client_sock);
+        log_now("[AUTH FAIL] " + campus + " from " + client_ip);
+        return;
+    }
+
+    {
+        lock_guard<mutex> lock(clients_mtx);
+        clients[campus] = { client_sock, campus, time(nullptr) };
+    }
+    string ok = "AUTH_OK|Welcome " + campus + "\n";
+    send(client_sock, ok.c_str(), ok.size(), 0);
+    log_now("[AUTH] " + campus + " connected from " + client_ip);
+
+    // receive loop
+    while (true) {
+        ssize_t r = recv(client_sock, buf, sizeof(buf)-1, 0);
+        if (r <= 0) break;
+        buf[r] = 0;
+        string pkt(buf);
+        vector<string> p;
+        {
+            istringstream ss(pkt); string t;
+            while (getline(ss,t,'|')) p.push_back(t);
+        }
+        
+        // --- UPDATED LOGIC START ---
+        if (p.size() >= 6 && (p[0] == "MSG" || p[0] == "FILE")) {
+            MessageRecord mr;
+            mr.type = p[0]; // Capture MSG or FILE
+            mr.from_campus = p[1];
+            mr.from_dept = p[2];
+            mr.to_campus = p[3];
+            mr.to_dept = p[4];
+            
+            // extract payload (everything after 5th '|')
+            size_t pos = 0; int cnt=0;
+            for (size_t i=0;i<pkt.size();++i) {
+                if (pkt[i]=='|') { cnt++; if (cnt==5) { pos = i+1; break; } }
+            }
+            mr.payload = (pos < pkt.size()) ? pkt.substr(pos) : "";
+            mr.ts = time(nullptr);
+
+            if (mr.to_campus == "Islamabad") {
+                // store messages destined for Islamabad in Islamabad inbox (existing design)
+                store_isb_inbox(mr);
+                log_now("[ROUTE] Stored to Islamabad inbox from " + mr.from_campus + "-" + mr.from_dept);
+            } else {
+                bool ok = forward_to_client(mr);
+                if (ok) {
+                    log_now("[ROUTE] " + mr.from_campus + "-" + mr.from_dept + " -> " + mr.to_campus + "-" + mr.to_dept);
+                } else {
+                    // store under destination so admin can see pending messages for that dest
+                    string destKey = mr.to_campus + "|" + mr.to_dept;
+                    {
+                        lock_guard<mutex> lock(inbox_mtx);
+                        serverInbox[destKey].msgs.push_back(mr);
+                        serverInbox[destKey].unread++;
+                    }
+                    log_now("[ROUTE FAIL] dest offline: " + mr.to_campus + "-" + mr.to_dept);
+                    lock_guard<mutex> lock(clients_mtx);
+                    if (clients.count(mr.from_campus) && clients[mr.from_campus].sockfd >= 0) {
+                        string err = "ERROR|Destination offline: " + mr.to_campus + "\n";
+                        send(clients[mr.from_campus].sockfd, err.c_str(), err.size(), 0);
+                    }
+                }
+            }
+        // --- UPDATED LOGIC END ---
+        
+        } else if (p.size() >= 1 && p[0] == "PING") {
+            lock_guard<mutex> lock(clients_mtx);
+            if (clients.count(campus)) clients[campus].last_seen = time(nullptr);
+            send(client_sock, string("PONG\n").c_str(), 5, 0);
+        } else {
+            string err = "ERROR|Invalid packet\n";
+            send(client_sock, err.c_str(), err.size(), 0);
+        }
+    }
+
+    close(client_sock);
+    {
+        lock_guard<mutex> lock(clients_mtx);
+        clients.erase(campus);
+    }
+    log_now("[DISCONNECT] " + campus);
+}
+// admin console
+void admin_console() {
+    string cmd;
+    while (true) {
+        cout << "\n[ADMIN] Type 'help' for commands > ";
+        if (!getline(cin, cmd)) break;
+        if (cmd.empty()) continue;
+
+        if (cmd == "help") {
+            cout << "Commands:\n"
+                 << "  hbshow                      - show heartbeat status\n"
+                 << "  list                        - show connected campuses & last_seen\n"
+                 << "  inbox                       - list Islamabad inbox chats\n"
+                 << "  open <campus|dept>          - open chat & reply\n"
+                 << "  broadcast <message>         - send UDP broadcast\n"
+                 << "  sendislamabad <C>|<D>|<msg> - send message as Islamabad\n"
+                 << "  help\n"
+                 << "  exit\n";
+        } else if (cmd == "list") {
+            lock_guard<mutex> lock(clients_mtx);
+            cout << "Connected campuses:\n";
+            for (auto &c : clients) {
+                string last = c.second.last_seen ? string(ctime(&c.second.last_seen)) : string("N/A\n");
+                if (!last.empty() && last.back()=='\n') last.pop_back();
+                cout << " - " << c.first << " | last_seen: " << last << "\n";
+            }
+        } else if (cmd == "hbshow") {
+            lock_guard<mutex> lock(hb_mtx);
+            if (lastHeartbeat.empty()) {
+                cout << "No heartbeat received yet.\n";
+                continue;
+            }
+            cout << "\n=== HEARTBEAT STATUS ===\n";
+            for (auto &p : lastHeartbeat) {
+                string t = p.second ? string(ctime(&p.second)) : string("N/A\n");
+                if (!t.empty() && t.back()=='\n') t.pop_back();
+                cout << "[HB] " << setw(12) << left << p.first << " | last: " << t << "\n";
+            }
+            cout << "========================\n";
+        } else if (cmd == "inbox") {
+            lock_guard<mutex> lock(inbox_mtx);
+            if (serverInbox.empty()) { cout << "Inbox empty\n"; continue; }
+            int i=1;
+            for (auto &e : serverInbox) {
+                cout << i++ << ") " << e.first << " (NEW: " << e.second.unread << ")\n";
+            }
+        } else if (cmd.rfind("open ",0) == 0) {
+            string key = cmd.substr(5);
+            lock_guard<mutex> lock(inbox_mtx);
+            if (!serverInbox.count(key)) { cout << "No chat: " << key << "\n"; continue; }
+            auto &ce = serverInbox[key];
+            cout << "---- Chat: " << key << " ----\n";
+            for (size_t i=0;i<ce.msgs.size();++i) {
+                auto &m = ce.msgs[i];
+                string t = string(ctime(&m.ts)); if (!t.empty() && t.back()=='\n') t.pop_back();
+                cout << i+1 << ") [" << t << "] " << m.from_campus << "-" << m.from_dept << ": " << m.payload << "\n";
+            }
+            ce.unread = 0;
+            cout << "Reply? (y/n): ";
+            string ans; getline(cin, ans);
+            if (ans == "y" || ans == "Y") {
+                cout << "Enter message: ";
+                string text; getline(cin, text);
+                size_t pos = key.find('|');
+                string destC = key.substr(0,pos);
+                string destD = key.substr(pos+1);
+                MessageRecord out;
+                out.from_campus = "Islamabad";
+                out.from_dept = "Admin";
+                out.to_campus = destC;
+                out.to_dept = destD;
+                out.payload = text;
+                out.ts = time(nullptr);
+                if (!forward_to_client(out)) {
+                    cout << "Destination offline. Message stored locally.\n";
+                    serverInbox[destC + "|" + destD].msgs.push_back(out);
+                    serverInbox[destC + "|" + destD].unread++;
+                } else {
+                    cout << "Sent to " << destC << "\n";
+                }
+            }
+        } else if (cmd.rfind("broadcast ",0) == 0) {
+            string msg = cmd.substr(10);
+            send_udp_broadcast(msg);
+        } else if (cmd.rfind("sendislamabad ",0) == 0) {
+            string rest = cmd.substr(14);
+            size_t p1 = rest.find('|');
+            size_t p2 = rest.find('|', p1+1);
+            if (p1==string::npos || p2==string::npos) { cout << "Bad format\n"; continue; }
+            string dstC = rest.substr(0,p1);
+            string dstD = rest.substr(p1+1,p2-p1-1);
+            string msg = rest.substr(p2+1);
+            MessageRecord out;
+            out.from_campus = "Islamabad";
+            out.from_dept = "Admin";
+            out.to_campus = dstC;
+            out.to_dept = dstD;
+            out.payload = msg;
+            out.ts = time(nullptr);
+            if (!forward_to_client(out)) {
+                serverInbox[dstC + "|" + dstD].msgs.push_back(out);
+                serverInbox[dstC + "|" + dstD].unread++;
+                cout << "Destination offline; stored\n";
+            } else cout << "Sent\n";
+        } else if (cmd == "exit") {
+            log_now("Admin requested shutdown.");
+            exit(0);
+        } else {
+            cout << "Unknown command (type help)\n";
+        }
+    }
+}
+
+int main() {
+    thread udpt(udp_listener); udpt.detach();
+    thread adm(admin_console); adm.detach();
+
+    int tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_sock < 0) { perror("tcp socket"); return 1; }
+    sockaddr_in serv{};
+    serv.sin_family = AF_INET;
+    serv.sin_port = htons(TCP_PORT);
+    serv.sin_addr.s_addr = INADDR_ANY;
+
+    int opt = 1;
+    setsockopt(tcp_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (bind(tcp_sock, (sockaddr*)&serv, sizeof(serv)) < 0) { perror("bind"); close(tcp_sock); return 1; }
+    if (listen(tcp_sock, 10) < 0) { perror("listen"); close(tcp_sock); return 1; }
+
+    log_now("Central Server (Islamabad) started (TCP & UDP).");
+
+    while (true) {
+        sockaddr_in cli{};
+        socklen_t len = sizeof(cli);
+        int client_fd = accept(tcp_sock, (sockaddr*)&cli, &len);
+        if (client_fd < 0) continue;
+        string cip = inet_ntoa(cli.sin_addr);
+        thread t(handle_tcp_client, client_fd, cip);
+        t.detach();
+    }
+
+    close(tcp_sock);
+    return 0;
+}
+
