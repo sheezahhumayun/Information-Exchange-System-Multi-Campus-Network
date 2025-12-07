@@ -1,10 +1,10 @@
-Campus Communications System (CCS) 🎓
+# Campus Communications System (CCS) 🎓
 
 The Campus Communications System (CCS) is a robust, hybrid networking application built in C++ that facilitates real-time, inter-departmental, and inter-campus communication using a strategic combination of TCP for reliability and UDP for speed.
 
 This system is designed around a central server (simulating the Islamabad campus) that handles client authentication, message routing, file transfer, and network monitoring for satellite campuses (e.g., Lahore, Karachi).
 
-✨ Features
+# ✨ Features
 
 Hybrid Protocol Architecture
 
@@ -40,7 +40,7 @@ g++ -std=c++11 server.cpp -o server -pthread
 # Compile the Client executable
 g++ -std=c++11 campus_client.cpp -o campus_client -pthread
 
-Running the System
+# Running the System
 
 Start the Server:
 
